@@ -192,8 +192,12 @@ cmake_language(DEFER CALL eden_render_isa_options)
 '@ | Set-Content -LiteralPath $include -Encoding ASCII
     }
 
+    # Bundled packages (Qt, OpenSSL, SDL3, FFmpeg...) are kept in cpm-cache next to this script,
+    # not inside the source folder, so extracting a new source zip doesn't download them again.
+    $cpmCache = Join-Path $root 'cpm-cache'
     $cmakeArgs = @('-S', $sourceDir, '-B', $buildDir, '-G', 'Ninja',
-                   '-DCMAKE_EXE_LINKER_FLAGS:STRING=/machine:x64')
+                   '-DCMAKE_EXE_LINKER_FLAGS:STRING=/machine:x64',
+                   "-DCPM_SOURCE_CACHE:PATH=$cpmCache")
     foreach ($line in Get-Content -LiteralPath (Join-Path $root 'cmake-options.txt')) {
         $entry = $line.Trim()
         if ($entry -notmatch '^([A-Za-z0-9_]+):[A-Za-z0-9_]+=') { continue }
@@ -208,10 +212,27 @@ cmake_language(DEFER CALL eden_render_isa_options)
         $cmakeArgs += "-DCMAKE_PROJECT_yuzu_INCLUDE:FILEPATH=$include"
     }
 
-    $code = Invoke-Logged 'cmake' $cmakeArgs
+    # CMake downloads checksums for its bundled packages from GitHub on every configure (and the
+    # build reruns configure when CMake files change). Those downloads fail now and then; retry
+    # a failed step up to 4 times when that is the reason, instead of failing the whole build.
+    function Invoke-LoggedRetry([string]$Exe, [string[]]$Arguments) {
+        for ($attempt = 1; ; $attempt++) {
+            $before = 0
+            if (Test-Path $toolLog) { $before = "$(Get-Content -LiteralPath $toolLog -Raw)".Length }
+            $result = Invoke-Logged $Exe $Arguments
+            if (-not $result -or $attempt -ge 4) { return $result }
+            $text = "$(Get-Content -LiteralPath $toolLog -Raw)"
+            $tail = if ($text.Length -gt $before) { $text.Substring($before) } else { $text }
+            if ($tail -notmatch 'Failed to download') { return $result }
+            Write-Warning "A GitHub download failed (attempt $attempt of 4); retrying in 20 seconds..."
+            Start-Sleep -Seconds 20
+        }
+    }
+
+    $code = Invoke-LoggedRetry 'cmake' $cmakeArgs
     if ($code) { throw "CMake configure failed ($code). See $toolLog" }
 
-    $code = Invoke-Logged 'cmake' @('--build', $buildDir, '--target', 'yuzu', '--parallel', "$Jobs")
+    $code = Invoke-LoggedRetry 'cmake' @('--build', $buildDir, '--target', 'yuzu', '--parallel', "$Jobs")
     if ($code) { throw "Build failed ($code). See $toolLog" }
 
     $exe = Join-Path $buildDir 'bin\eden.exe'
@@ -255,6 +276,15 @@ cmake_language(DEFER CALL eden_render_isa_options)
         } else {
             Write-Warning 'portable-config not found: the package will start with default settings, and Fortune''s Weave needs the 12 GB memory layout.'
         }
+        # Kompas9's ultrawide patch is built into the exe (setting fefw_ultrawide): its MIT notice.
+        $uwLicense = Join-Path $root 'licenses\ultrawide-kompas9'
+        if (Test-Path $uwLicense) {
+            $uwDest = Join-Path $outDir 'licenses\ultrawide-kompas9'
+            New-Item -ItemType Directory -Force -Path $uwDest | Out-Null
+            Copy-Item -Path (Join-Path $uwLicense '*') -Destination $uwDest
+        } else {
+            Write-Warning 'licenses\ultrawide-kompas9 not found: the package will lack the ultrawide patch notice.'
+        }
         if ($hasFpsMod) {
             $modDest = Join-Path $userDir 'load\04007EF01F8AE000'
             New-Item -ItemType Directory -Force -Path $modDest | Out-Null
@@ -273,8 +303,16 @@ user\load\04007EF01F8AE000\60fps (unticking it isn't always enough).
 It only works with the game version whose build ID starts DB93B0125F485060;
 other versions just ignore it.
 "@ } else { '' }
+        $optionalText = @"
+
+ULTRAWIDE 3440x1440 (optional, OFF by default) - for 21:9 monitors: Emulation > Configure >
+Graphics, tick "Ultrawide 3440x1440 (21:9) for Fortune's Weave", then start the game and play
+fullscreen. It widens the 3D camera and keeps the HUD, menus and movies centred at 16:9
+(movies get black bars). Kompas9's patch (MIT, licenses\ultrawide-kompas9); only for game
+version 1.1.0 (build ID DB93B0125F485060).
+"@
         @"
-Fortune's Eden (FEFW Stable with 60 FPS Patch) v1.4.2 - portable Windows x64 build
+Fortune's Eden (FEFW Stable with 60 FPS Patch) v1.6.1 - portable Windows x64 build
 (Eden FE: Fortune's Weave fork, built on Duck912's eden-ns2-fe and xDarkWindx's eden-fefw $Version)
 
 Runs on any 64-bit Windows 10/11 PC with a Vulkan-capable GPU. No CPU-specific code
@@ -296,18 +334,65 @@ touch any other Eden install. To move it, move the whole folder. Deleting it del
 
 SETTINGS are already set up globally (Emulation > Configure), so they apply however the game
 is dumped or packed: the 12 GB memory layout the game needs, GPU accuracy Fast, asynchronous
-shaders on, vsync off, 16x anisotropic filtering, VRAM Usage Mode Conservative (avoids
-long-session freezes), AMD FSR window filter at 0% sharpness and FXAA anti-aliasing.
+shaders on, vsync off, 16x anisotropic filtering, VRAM Usage Mode Conservative (up to three
+quarters of the card's video memory), ASTC recompression Auto, AMD FSR window filter at 0%
+sharpness and FXAA anti-aliasing.
+
+ASTC RECOMPRESSION (Graphics > Advanced): Auto picks BC3, which the graphics card now
+re-compresses itself: a quarter of the video memory of Uncompressed, without the freezes BC3
+used to cause. Uncompressed needs a lot of video memory: on a card with less than 20 GB the game
+can run out and stutter or drop to single-digit FPS. The log says what Auto picked.
 Only controls need setting: Emulation > Configure > Controls.
 
 NVIDIA DLSS (optional, GeForce RTX cards): Emulation > Configure > Graphics, tick
 "Use NVIDIA DLSS in place of the game's DLSS", then click "Download from NVIDIA" in the panel
 below it (NVIDIA's files aren't included). Takes effect when the game starts. It replaces the
 game's own lightweight DLSS with the full PC version: sharper, with less ghosting.
-$fpsText
+$fpsText$optionalText
+
+New in v1.6.1:
+- Fixes 8 GB cards dropping to about 2 FPS for minutes when a scene loads many textures at
+  once: the GPU texture conversion's temporary images now have a memory limit.
+- UI smearing at the screen edges while moving comes from frame generation (NVIDIA Smooth
+  Motion or Lossless Scaling), not the emulator: turn it off for this program.
+- The resolution options show this game's real sizes: 1X is 1440p, 1.5X 4K, 2X 5K.
+
+New in v1.6:
+- ASTC textures are re-compressed to BC3 on the GPU (from Eglantine, Duck912), so battle starts
+  no longer freeze while textures convert, and Auto picks BC3 on every card (about half the video memory).
+- Smoother play when video memory fills up: ASTC textures unused for 30 s are freed early.
+
+New in v1.5.2:
+- Fixes a crash inside the NVIDIA driver (nvoglv64.dll) a few minutes into some sessions with
+  NVIDIA DLSS on: drawing DLSS's output could start with a framebuffer the texture cache had
+  just removed. From Eglantine (Duck912).
+
+New in v1.5.1:
+- Game updates: the main menu shows the update's version (1.1.0, not 1.0.0), also for .nup
+  files that don't record one; loose dumps can carry an update in an updates\<number>\ folder.
+- ASTC recompression Auto (see above), and big cards may use three quarters of their video
+  memory instead of about 7 GB.
+- Laptops and 4-core CPUs: sound no longer stutters in battles (audio threads at top priority;
+  the GPU thread split turns itself off with 4 or fewer fast cores).
+- Threads wait properly on newer CPUs (from Eglantine); fewer shader hitches during fades;
+  crash fixes for window resizing, failed shaders, NVIDIA depth copies and stopping the game.
+- Cutscene video keeps up with the voices on slower PCs.
+- Logs show frame pacing every 10 s and video memory use every minute.
 
 Changes from upstream:
 - Optional NVIDIA DLSS in place of the game's own DLSS (from Duck912's work in Eglantine).
+- The sky no longer turns black after opening the map: the texture cache threw away the game's
+  sky colour table while the map covered the screen, without keeping what the GPU had drawn.
+  Small images the GPU drew are now always kept.
+- No more recurring stutter from an experiment left on by mistake in v1.3.1 to v1.4.2 (held
+  CPU writes reached the GPU a frame late, so frames came out unevenly).
+- CPU Clocks (Boost/Overclock) is gone: it ran the game's clock 1.7-2x fast, so cutscene voices
+  dropped out and dialogue animations ended early.
+- Slightly smoother busy scenes: the GPU back thread answers most "has the GPU written here?"
+  checks from a page bitmap instead of searching a tree (same answers).
+- Much smaller logs: no line per frame, one line per unmapped memory read, so long sessions'
+  logs stay small enough to send.
+- Optional ultrawide 3440x1440 (21:9) setting, off by default: Kompas9's patch (MIT), built in.
 - Bath scenes no longer lose their background: a compute shader using a shared-memory
   compare-and-swap (ATOMS.CAS) is now translated instead of skipped.
 - Cutscenes keep up: AV1 videos are decoded several frames at once, so the busiest 1440p
@@ -315,9 +400,7 @@ Changes from upstream:
 - A user folder copied from another build uses its own saves and folders here, not the old
   build's (and Open Save Data Location opens the one next to this exe).
 - Smoother 60 FPS in busy scenes: texture-handle tables the game builds on the GPU and never
-  changes are no longer waited for once a frame, and CPU writes to GPU memory take the cache
-  lock far less often. In Dagsion's busiest section at 60 FPS, doubled frames went from about
-  45% to about 20%.
+  changes are no longer waited for once a frame.
 - Fewer shader-compile stutters: translated shaders are reused between pipelines that share
   them (Wael3rd, from PokeDinner).
 - Loose-file dumps use the game's real ID, so their saves sit with .nup saves.
